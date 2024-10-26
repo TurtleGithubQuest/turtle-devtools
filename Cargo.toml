@@ -1,0 +1,29 @@
+[package]
+name = "turtle-devtools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.41.0", features = ["macros", "rt-multi-thread", "process", "sync", "fs"] }
+clap = { version = "4.5.2", features = ["derive"] }
+colored = "2.0"
+toml = "0.8.19"
+serde = { version = "1.0.213", features = ["derive"] }
+dotenv = "0.15.0"
+ssh2 = "0.9.4"
+async-trait = "0.1.83"
+async_ftp = { version = "6.0.0", features = ["tokio-rustls"] }
+async-recursion = "1.1.1"
+futures = "0.3.31"
+thiserror = "1.0.65"
+anyhow = "1.0.91"
+notify = "7.0.0"
+
+swc_bundler = "1.0.0"
+swc_common = { version = "1.0.0", features = ["tty-emitter"] }
+swc_ecma_parser = "1.0.1"
+swc_ecma_codegen = "1.0.0"
+swc_ecma_ast = "1.0.0"
+swc_ecma_loader = "1.0.0"
+
+grass = "0.13.4"
