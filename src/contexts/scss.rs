@@ -1,5 +1,4 @@
-use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use grass;
 use serde::Deserialize;
 use crate::contexts::{BuildContext, BaseContext};
@@ -22,7 +21,7 @@ impl BuildContext for Context {
         &self.base
     }
 
-    fn build(&self, changed_file: Option<&Path>) -> Result<(), CommonError> {
+    fn build(&self, path: Option<&PathBuf>) -> Result<(), CommonError> {
         self.log();
         let output_folder = self.get_output_folder()?;
 
@@ -30,8 +29,8 @@ impl BuildContext for Context {
             std::fs::create_dir_all(&output_folder).map_err(transfer::TransferError::IoError)?;
         }
         
-        if let Some(changed_file) = changed_file {
-            self.build(changed_file, &output_folder)?;
+        if let Some(path) = path {
+            self.build(path.as_path(), &output_folder)?;
         } else {
             for entrypoint in self.get_entrypoints() {
                 let entrypoint_path = Path::new(&entrypoint.entrypoint);
@@ -47,11 +46,15 @@ impl Context {
         if !scss_path.exists() {
             return Err(TransferError::PathError(format!("SCSS file {:?} does not exist.", scss_path)).into());
         }
-
+        
+        if scss_path.is_dir() {
+            return Err(CommonError::Error(format!("Scss path is a folder {:?}.", scss_path)));
+        }
+        
         let css = grass::from_path(
             scss_path.to_str().unwrap(),
             &grass::Options::default(),
-        ).unwrap();
+        ).map_err(|err| CommonError::GrassError(*err))?;
 
         let file_stem = scss_path.file_stem().unwrap();
         let css_output_path = output_folder.join(format!("{}.css", file_stem.to_string_lossy()));

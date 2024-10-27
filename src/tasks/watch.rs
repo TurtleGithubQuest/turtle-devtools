@@ -1,11 +1,12 @@
+use std::ops::Deref;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::misc::util::{color_log, get_credentials};
 use tokio::task::LocalSet;
 use crate::misc::transfer::{FileTransfer, upload_directory, get_transfer};
 use colored::Color;
-use notify::event::ModifyKind;
+use notify::event::{DataChange, ModifyKind};
 use crate::contexts::BuildContext;
 use crate::misc::config::{CONFIG};
 use crate::misc::errors::common::CommonError;
@@ -58,14 +59,12 @@ pub async fn execute() -> Result<(), CommonError> {
 
         // Process events
         while let Some(Ok(event)) = rx.recv().await {
-            if event.kind == EventKind::Modify(ModifyKind::Any) {
+            if event.kind == EventKind::Modify(ModifyKind::Data(DataChange::Content)) {
                 continue;
             }
             if let Some(path) = event.paths.first() {
-                let path = path.clone();
-                let config = config.clone();
-                if let Err(e) = handle_file_change(&mut transfer, path, config).await {
-                    eprintln!("Error handling file change: {:?}", e);
+                if let Err(e) = handle_file_change(&mut transfer, path, config.clone()).await {
+                    color_log(Color::Red,&format!("Error handling file change: {:?}", e) );
                 }
             }
         }
@@ -80,26 +79,26 @@ pub async fn execute() -> Result<(), CommonError> {
 
 async fn handle_file_change(
     transfer: &mut Box<dyn FileTransfer>,
-    changed_path: PathBuf,
+    changed_path: &PathBuf,
     config: crate::config::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut contexts_to_build: Vec<&dyn BuildContext> = Vec::new();
 
     if let Some(ref scss_context) = config.contexts.scss {
-        if scss_context.is_file_in_context(&changed_path) {
+        if scss_context.is_file_in_context(changed_path) {
             contexts_to_build.push(scss_context);
         }
     }
 
     if let Some(ref js_context) = config.contexts.js {
-        if js_context.is_file_in_context(&changed_path) {
+        if js_context.is_file_in_context(changed_path) {
             contexts_to_build.push(js_context);
         }
     }
     
     for context in contexts_to_build {
         color_log(Color::Yellow, &format!("Building {} context...", context.context_name()));
-        context.build(Some(&changed_path))?;
+        context.build(Some(changed_path))?;
 
         let output_folder = context.get_output_folder()?;
 

@@ -21,7 +21,7 @@ pub trait BuildContext {
         );
     }
 
-    fn build(&self, changed_file: Option<&Path>) -> Result<(), CommonError>;
+    fn build(&self, path: Option<&PathBuf>) -> Result<(), CommonError>;
 
     fn get_output_folder(&self) -> Result<PathBuf, CommonError> {
         let config = CONFIG.get().ok_or_else(|| CommonError::ConfigNotFound("Config not loaded".into()))?;
@@ -36,10 +36,16 @@ pub trait BuildContext {
     fn get_entrypoints(&self) -> &Vec<EntryPoint> {
         &self.base().entrypoints
     }
-    fn is_file_in_context(&self, file_path: &Path) -> bool {
+    fn is_file_in_context(&self, path: &Path) -> bool {
+        let absolute_file_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    
         self.get_entrypoints().iter().any(|entry| {
             let folder_path = Path::new(&entry.folder);
-            file_path.ends_with(folder_path)
+            let absolute_folder_path = folder_path.canonicalize().unwrap_or_else(|_| {
+                std::env::current_dir().unwrap().join(folder_path)
+            });
+    
+            absolute_file_path.starts_with(&absolute_folder_path)
         })
     }
 }
