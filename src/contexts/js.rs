@@ -6,14 +6,17 @@ use serde::Deserialize;
 use crate::misc::errors::common::CommonError;
 use crate::misc::errors::transfer;
 
-use swc_common::{Globals, SourceMap, FileName, Span};
-use swc_bundler::{Bundler, Load, ModuleData, Resolve, Hook, ModuleRecord};
+use swc_common::{SourceMap, FileName, Span};
+use swc_bundler::{Bundler, Load, ModuleData, Hook, ModuleRecord};
 use swc_ecma_parser::{Syntax, parse_file_as_module, EsSyntax};
 use swc_ecma_codegen::{Emitter, text_writer::JsWriter, Config as CodegenConfig};
 use swc_common::errors::Handler;
 use swc_common::sync::Lrc;
 use swc_ecma_ast::{Bool, EsVersion, Expr, IdentName, KeyValueProp, Lit, MemberExpr, MemberProp, MetaPropExpr, MetaPropKind, PropName, Str};
-use swc_ecma_loader::resolve::Resolution;
+use swc_ecma_loader::{
+    resolvers::{lru::CachingResolver, node::NodeModulesResolver},
+    TargetEnv,
+};
 
 #[derive(Deserialize, Clone)]
 pub struct Context {
@@ -33,25 +36,48 @@ impl BuildContext for Context {
     fn build(&self, path: Option<&PathBuf>) -> Result<(), CommonError> {
         let output_folder = self.get_output_folder()?;
 
-        // Ensure the output folder exists
         if !output_folder.exists() {
             std::fs::create_dir_all(&output_folder).map_err(transfer::TransferError::IoError)?;
         }
-        let mut build_entrypoints = false;
-        
+
         if let Some(path) = path {
-            let is_entrypoint = self.get_entrypoints().iter().any(|entry| {
-                Path::new(&entry.entrypoint).canonicalize().ok() == path.canonicalize().ok()
-            });
-            if !is_entrypoint {
-                self.build(path.as_path(), &output_folder)?;
+            let edited_path = path.canonicalize()
+                .map_err(|e| CommonError::Error(format!("Failed to canonicalize path: {:?}", e)))?;
+            let mut is_entrypoint = false;
+            let mut found_in_entrypoint_folder = false;
+
+            for entry in self.get_entrypoints() {
+                let entrypoint_path = Path::new(&entry.entrypoint).canonicalize()
+                    .map_err(|e| CommonError::Error(format!("Failed to canonicalize entrypoint path: {:?}", e)))?;
+                if edited_path == entrypoint_path {
+                    self.build(&edited_path, &output_folder)?;
+                    is_entrypoint = true;
+                    break;
+                }
             }
-            build_entrypoints = is_entrypoint
-        } 
-        if build_entrypoints {
+
+            if !is_entrypoint {
+                for entry in self.get_entrypoints() {
+                    let folder_path = Path::new(&entry.folder).canonicalize()
+                        .map_err(|e| CommonError::Error(format!("Failed to canonicalize folder path: {:?}", e)))?;
+                    if edited_path.starts_with(&folder_path) {
+                        let entrypoint_path = Path::new(&entry.entrypoint).canonicalize()
+                            .map_err(|e| CommonError::Error(format!("Failed to canonicalize entrypoint path: {:?}", e)))?;
+                        self.build(&entrypoint_path, &output_folder)?;
+                        found_in_entrypoint_folder = true;
+                        break;
+                    }
+                }
+
+                if !found_in_entrypoint_folder {
+                    self.build(&edited_path, &output_folder)?;
+                }
+            }
+        } else { // No specific path provided; rebuild all entrypoints
             for entrypoint in self.get_entrypoints() {
-                let entrypoint_path = Path::new(&entrypoint.entrypoint);
-                self.build(entrypoint_path, &output_folder)?;
+                let entrypoint_path = Path::new(&entrypoint.entrypoint).canonicalize()
+                    .map_err(|e| CommonError::Error(format!("Failed to canonicalize entrypoint path: {:?}", e)))?;
+                self.build(&entrypoint_path, &output_folder)?;
             }
         }
         Ok(())
@@ -66,7 +92,12 @@ impl Context {
         if js_path.is_dir() {
             return Err(CommonError::Error(format!("JavaScript path is a folder {:?}.", js_path)));
         }
-
+        
+        let module_name = js_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("bundle")
+            .to_string();
         let globals = Box::leak(Box::default());
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(
@@ -80,7 +111,10 @@ impl Context {
             globals,
             cm.clone(),
             FsLoader { cm: cm.clone(), handler },
-            SimpleResolver,
+            CachingResolver::new(
+                4096,
+                NodeModulesResolver::new(TargetEnv::Node, Default::default(), true),
+            ),
             swc_bundler::Config {
                 require: false,
                 disable_inliner: false,
@@ -117,8 +151,8 @@ impl Context {
                     String::from_utf8(buf).map_err(|e| CommonError::Error(format!("Failed to convert output to UTF-8: {:?}", e)))?
                 };
 
-                // Write the code to the output file
-                let output_file_path = output_folder.join("bundle.js"); // Adjust output filename as needed
+                let output_file_name = format!("{}.js", module_name);
+                let output_file_path = output_folder.join(output_file_name);
                 std::fs::write(&output_file_path, code).map_err(|e| CommonError::Error(format!("Failed to write output file: {:?}", e)))?;
             }
 
@@ -203,25 +237,5 @@ impl Load for FsLoader {
             module: module.unwrap(),
             helpers: Default::default(),
         })
-    }
-}
-
-struct SimpleResolver;
-
-impl Resolve for SimpleResolver {
-    fn resolve(&self, base: &FileName, dep: &str) -> Result<Resolution, anyhow::Error> {
-        let base_path = match base {
-            FileName::Real(path) => path.parent().unwrap(),
-            _ => Path::new("."),
-        };
-
-        let mut dep_path = PathBuf::from(dep);
-
-        if dep_path.is_relative() {
-            dep_path = base_path.join(dep_path);
-        }
-
-        let dep_path = dep_path.canonicalize()?;
-        Ok(Resolution { filename: FileName::Real(dep_path), slug: None })
     }
 }

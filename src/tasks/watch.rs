@@ -1,12 +1,15 @@
+use std::collections::HashMap;
 use std::ops::Deref;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use crate::misc::util::{color_log, get_credentials};
 use tokio::task::LocalSet;
 use crate::misc::transfer::{FileTransfer, upload_directory, get_transfer};
 use colored::Color;
 use notify::event::{DataChange, ModifyKind};
+use tokio::select;
 use crate::contexts::BuildContext;
 use crate::misc::config::{CONFIG};
 use crate::misc::errors::common::CommonError;
@@ -14,23 +17,20 @@ use crate::misc::errors::transfer::TransferError;
 
 pub async fn execute() -> Result<(), CommonError> {
     let local_set = LocalSet::new();
-    // Create a channel to receive file system events
     let (tx, mut rx) = mpsc::channel(100);
 
-    // Create a watcher object
     let mut watcher = RecommendedWatcher::new(
         move |res| {
-            futures::executor::block_on(async {
-                tx.send(res).await.unwrap();
-            })
+            let tx = tx.clone();
+            tx.try_send(res).unwrap();
         },
         notify::Config::default(),
     )?;
-    
+
     let config = CONFIG.get().ok_or_else(|| CommonError::ConfigNotFound("Config not loaded".into()))?;
     let mut paths_to_watch = Vec::new();
 
-    let result: Result<(), crate::misc::errors::common::CommonError> = local_set.run_until(async move {
+    let result: Result<(), CommonError> = local_set.run_until(async move {
         if let Some(ref scss_context) = config.contexts.scss {
             for entry in scss_context.get_entrypoints() {
                 paths_to_watch.push(PathBuf::from(&entry.folder));
@@ -57,14 +57,54 @@ pub async fn execute() -> Result<(), CommonError> {
 
         color_log(Color::Green, "Started watching for file changes...");
 
+        let mut debounce_map: HashMap<PathBuf, Instant> = HashMap::new();
+        let debounce_duration = Duration::from_millis(500);
+
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+
         // Process events
-        while let Some(Ok(event)) = rx.recv().await {
-            if event.kind == EventKind::Modify(ModifyKind::Data(DataChange::Content)) {
-                continue;
-            }
-            if let Some(path) = event.paths.first() {
-                if let Err(e) = handle_file_change(&mut transfer, path, config.clone()).await {
-                    color_log(Color::Red,&format!("Error handling file change: {:?}", e) );
+        loop {
+            select! {
+                Some(Ok(event)) = rx.recv() => {
+                    if let Some(changed_path) = event.paths.first() {
+                        let file_name = changed_path.file_name().unwrap_or_default();
+
+                        // Skip temporary or backup files (e.g., files ending with '~')
+                        if file_name.to_string_lossy().ends_with('~') {
+                            continue;
+                        }
+                        //DataChange::Content is not triggered?
+                        if let EventKind::Modify(ModifyKind::Data(DataChange::Any)) = event.kind {
+                            if changed_path.is_file() {
+                                debounce_map.insert(changed_path.clone(), Instant::now());
+                            }
+                        }
+                    }
+                }
+                _ = interval.tick() => {
+                    // Check debounce_map for paths to process
+                    let now = Instant::now();
+                    let mut to_process = Vec::new();
+
+                    debounce_map.retain(|path, &mut last_change| {
+                        if now.duration_since(last_change) >= debounce_duration {
+                            // Time to process this path
+                            to_process.push(path.clone());
+                            false // Remove from the map
+                        } else {
+                            true // Retain in the map
+                        }
+                    });
+
+                    for path in to_process {
+                        if let Err(e) = handle_file_change(&mut transfer, &path, config.clone()).await {
+                            color_log(Color::Red, &format!("Error handling file change: {:?}", e));
+                        }
+                    }
+                }
+                else => {
+                    // Channel closed or error occurred, exit loop
+                    break;
                 }
             }
         }

@@ -53,6 +53,8 @@ pub trait BuildContext {
 #[derive(Deserialize, Clone)]
 pub struct BaseContext {
     pub output_folder: Option<String>,
+    #[serde(default = "default_false")]
+    pub minify: bool,
     pub entrypoints: Vec<EntryPoint>,
 }
 
@@ -61,3 +63,5 @@ pub struct EntryPoint {
     pub folder: String,
     pub entrypoint: String,
 }
+
+fn default_false() -> bool { false }
