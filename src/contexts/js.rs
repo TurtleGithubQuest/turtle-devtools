@@ -1,22 +1,18 @@
-use std::collections::HashMap;
-use crate::contexts::{BuildContext, BaseContext};
-use std::path::{Path, PathBuf};
-use anyhow::Error;
-use serde::Deserialize;
+use crate::contexts::{BaseContext, BuildContext, EntryPoint};
+use crate::misc::config::CONFIG;
 use crate::misc::errors::common::CommonError;
-use crate::misc::errors::transfer;
-
-use swc_common::{SourceMap, FileName, Span};
-use swc_bundler::{Bundler, Load, ModuleData, Hook, ModuleRecord};
-use swc_ecma_parser::{Syntax, parse_file_as_module, EsSyntax};
-use swc_ecma_codegen::{Emitter, text_writer::JsWriter, Config as CodegenConfig};
-use swc_common::errors::Handler;
-use swc_common::sync::Lrc;
-use swc_ecma_ast::{Bool, EsVersion, Expr, IdentName, KeyValueProp, Lit, MemberExpr, MemberProp, MetaPropExpr, MetaPropKind, PropName, Str};
-use swc_ecma_loader::{
-    resolvers::{lru::CachingResolver, node::NodeModulesResolver},
-    TargetEnv,
+use crate::misc::util::color_log;
+use anyhow::{Context as AnyhowContext, Result};
+use colored::Color;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use swc::{
+    config::{Config, JscConfig, ModuleConfig, Options},
+    Compiler, PrintArgs,
 };
+use swc_common::{errors::Handler, FileName, SourceMap};
+use swc_ecma_parser::{Syntax, TsConfig};
 
 #[derive(Deserialize, Clone)]
 pub struct Context {
@@ -34,208 +30,154 @@ impl BuildContext for Context {
     }
 
     fn build(&self, path: Option<&PathBuf>) -> Result<(), CommonError> {
-        let output_folder = self.get_output_folder()?;
+        let compiler = Compiler::new(Arc::new(SourceMap::default()));
 
-        if !output_folder.exists() {
-            std::fs::create_dir_all(&output_folder).map_err(transfer::TransferError::IoError)?;
-        }
-
-        if let Some(path) = path {
-            let edited_path = path.canonicalize()
-                .map_err(|e| CommonError::Error(format!("Failed to canonicalize path: {:?}", e)))?;
-            let mut is_entrypoint = false;
-            let mut found_in_entrypoint_folder = false;
-
-            for entry in self.get_entrypoints() {
-                let entrypoint_path = Path::new(&entry.entrypoint).canonicalize()
-                    .map_err(|e| CommonError::Error(format!("Failed to canonicalize entrypoint path: {:?}", e)))?;
-                if edited_path == entrypoint_path {
-                    self.build(&edited_path, &output_folder)?;
-                    is_entrypoint = true;
-                    break;
-                }
-            }
-
-            if !is_entrypoint {
-                for entry in self.get_entrypoints() {
-                    let folder_path = Path::new(&entry.folder).canonicalize()
-                        .map_err(|e| CommonError::Error(format!("Failed to canonicalize folder path: {:?}", e)))?;
-                    if edited_path.starts_with(&folder_path) {
-                        let entrypoint_path = Path::new(&entry.entrypoint).canonicalize()
-                            .map_err(|e| CommonError::Error(format!("Failed to canonicalize entrypoint path: {:?}", e)))?;
-                        self.build(&entrypoint_path, &output_folder)?;
-                        found_in_entrypoint_folder = true;
-                        break;
-                    }
-                }
-
-                if !found_in_entrypoint_folder {
-                    self.build(&edited_path, &output_folder)?;
-                }
-            }
-        } else { // No specific path provided; rebuild all entrypoints
-            for entrypoint in self.get_entrypoints() {
-                let entrypoint_path = Path::new(&entrypoint.entrypoint).canonicalize()
-                    .map_err(|e| CommonError::Error(format!("Failed to canonicalize entrypoint path: {:?}", e)))?;
-                self.build(&entrypoint_path, &output_folder)?;
+        // If a specific path is provided, build only that file
+        if let Some(file_path) = path {
+            self.compile_file(&compiler, file_path)?;
+        } else {
+            // Otherwise, build all files in the context
+            for entry in &self.base.entrypoints {
+                let entry_folder = PathBuf::from(&entry.folder);
+                self.compile_folder(&compiler, &entry_folder)?;
             }
         }
+
         Ok(())
+    }
+
+    fn get_output_folder(&self) -> Result<PathBuf, CommonError> {
+        let config = CONFIG
+            .get()
+            .ok_or_else(|| CommonError::ConfigNotFound("Config not loaded".into()))?;
+        let global_output_folder = PathBuf::from(&config.output_folder);
+
+        let context_output_folder = self
+            .base()
+            .output_folder
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("js")); // Default to "js" if not specified
+
+        // Combine global output folder with context-specific folder
+        Ok(global_output_folder.join(context_output_folder))
+    }
+
+    fn get_entrypoints(&self) -> &Vec<EntryPoint> {
+        &self.base.entrypoints
     }
 }
 
 impl Context {
-    fn build(&self, js_path: &Path, output_folder: &Path) -> Result<(), CommonError> {
-        if !js_path.exists() {
-            return Err(CommonError::Error(format!("JavaScript file {:?} does not exist.", js_path)));
-        }
-        if js_path.is_dir() {
-            return Err(CommonError::Error(format!("JavaScript path is a folder {:?}.", js_path)));
-        }
-        
-        let module_name = js_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("bundle")
-            .to_string();
-        let globals = Box::leak(Box::default());
-        let cm: Lrc<SourceMap> = Default::default();
-        let handler = Handler::with_tty_emitter(
-            swc_common::errors::ColorConfig::Auto,
-            true,
-            false,
-            Some(cm.clone()),
-        );
+    fn compile_file(&self, compiler: &Compiler, file_path: &PathBuf) -> Result<(), CommonError> {
+        // Load the file into the source map
+        let fm = compiler
+            .cm
+            .load_file(file_path)
+            .map_err(|e| CommonError::Error(format!("Failed to load file: {:?}", e)))?;
 
-        let mut bundler = Bundler::new(
-            globals,
-            cm.clone(),
-            FsLoader { cm: cm.clone(), handler },
-            CachingResolver::new(
-                4096,
-                NodeModulesResolver::new(TargetEnv::Node, Default::default(), true),
-            ),
-            swc_bundler::Config {
-                require: false,
-                disable_inliner: false,
-                external_modules: Vec::new(),
+        // Configure SWC options
+        let options = Options {
+            config: Config {
+                jsc: JscConfig {
+                    syntax: Some(Syntax::Typescript(TsConfig::default())),
+                    ..Default::default()
+                },
+                module: Some(ModuleConfig::CommonJs(Default::default())), // Output as CommonJS
                 ..Default::default()
             },
-            Box::new(DummyHook),
-        );
-
-        let entries = HashMap::from([(String::from("main"), FileName::Real(js_path.to_path_buf()))]);
-        let modules = bundler
-            .bundle(entries)
-            .map_err(|e| CommonError::Error(format!("Failed to bundle: {:?}", e)))?;
-
-        // Set the global compiler context
-        swc_common::GLOBALS.set(globals, || {
-            for bundled_module in modules {
-                // Output the bundled code to the output folder
-                let code = {
-                    let mut buf = vec![];
-                    let mut emitter = Emitter {
-                        cfg: CodegenConfig::default().with_minify(false), //todo: load value from config
-                        cm: cm.clone(),
-                        comments: None,
-                        wr: Box::new(JsWriter::new(
-                            cm.clone(),
-                            "\n",
-                            &mut buf,
-                            None,
-                        )),
-                    };
-                    emitter.emit_module(&bundled_module.module).map_err(|e| CommonError::Error(format!("Failed to emit code: {:?}", e)))?;
-
-                    String::from_utf8(buf).map_err(|e| CommonError::Error(format!("Failed to convert output to UTF-8: {:?}", e)))?
-                };
-
-                let output_file_name = format!("{}.js", module_name);
-                let output_file_path = output_folder.join(output_file_name);
-                std::fs::write(&output_file_path, code).map_err(|e| CommonError::Error(format!("Failed to write output file: {:?}", e)))?;
-            }
-
-            Ok(())
-        })
-    }
-}
-
-struct DummyHook;
-
-impl Hook for DummyHook {
-    fn get_import_meta_props(
-        &self,
-        span: Span,
-        module_record: &ModuleRecord,
-    ) -> Result<Vec<KeyValueProp>, Error> {
-        let file_name = module_record.file_name.to_string();
-
-        Ok(vec![
-            KeyValueProp {
-                key: PropName::Ident(IdentName::new("url".into(), span)),
-                value: Box::new(Expr::Lit(Lit::Str(Str {
-                    span,
-                    raw: None,
-                    value: file_name.into(),
-                }))),
-            },
-            KeyValueProp {
-                key: PropName::Ident(IdentName::new("main".into(), span)),
-                value: Box::new(if module_record.is_entry {
-                    Expr::Member(MemberExpr {
-                        span,
-                        obj: Box::new(Expr::MetaProp(MetaPropExpr {
-                            span,
-                            kind: MetaPropKind::ImportMeta,
-                        })),
-                        prop: MemberProp::Ident(IdentName::new("main".into(), span)),
-                    })
-                } else {
-                    Expr::Lit(Lit::Bool(Bool { span, value: false }))
-                }),
-            },
-        ])
-    }
-}
-
-struct FsLoader {
-    cm: Lrc<SourceMap>,
-    handler: Handler,
-}
-
-impl Load for FsLoader {
-    fn load(&self, file_name: &FileName) -> Result<ModuleData, anyhow::Error> {
-        let path = match &file_name {
-            FileName::Real(path) => path.clone(),
-            _ => panic!("Expected real file name, got {:?}", file_name),
+            output_path: Some(self.get_output_path(file_path)?),
+            ..Default::default()
         };
 
-        let fm = self.cm.load_file(&path)?;
-        let mut errors = vec![];
+        // Create a handler for error reporting
+        let handler =
+            Handler::with_emitter_writer(Box::new(std::io::stderr()), Some(compiler.cm.clone()));
 
-        let module = parse_file_as_module(
-            &fm,
-            Syntax::Es(EsSyntax {
-                jsx: true,
-                import_attributes: true,
-                ..Default::default()
-            }),
-            EsVersion::Es2022,
-            None,
-            &mut errors,
-        );
-        if !errors.is_empty() {
-            for e in errors {
-                e.into_diagnostic(&self.handler).emit();
-            }
-            return Err(anyhow::Error::msg("Parsing errors occurred."));
+        // Parse and transform the TypeScript file
+        let program = compiler
+            .parse_js(
+                fm,
+                &handler,
+                swc_ecma_ast::EsVersion::Es2022,
+                Syntax::Typescript(TsConfig::default()),
+                swc::config::IsModule::Bool(true),
+                Some(compiler.comments()),
+            )
+            .map_err(|e| CommonError::Error(format!("Failed to parse TypeScript: {:?}", e)))?;
+
+        // Print the transformed JavaScript code
+        let output = compiler
+            .print(&program, PrintArgs::default())
+            .map_err(|e| CommonError::Error(format!("Failed to print JavaScript: {:?}", e)))?;
+
+        // Write the output to the destination file
+        let output_path = self.get_output_path(file_path)?;
+        std::fs::write(&output_path, output.code)
+            .map_err(|e| CommonError::Error(format!("Failed to write output file: {:?}", e)))?;
+
+        Ok(())
+    }
+
+    fn compile_folder(
+        &self,
+        compiler: &Compiler,
+        folder_path: &PathBuf,
+    ) -> Result<(), CommonError> {
+        // Walk through the folder and compile all TypeScript files
+        for entry in ignore::Walk::new(folder_path)
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map_or(false, |ext| ext == "ts" || ext == "tsx")
+            })
+        {
+            self.compile_file(compiler, &entry.path().to_path_buf())?;
         }
 
-        Ok(ModuleData {
-            fm,
-            module: module.unwrap(),
-            helpers: Default::default(),
-        })
+        Ok(())
+    }
+
+    fn get_output_path(&self, input_path: &PathBuf) -> Result<PathBuf, CommonError> {
+        for entrypoint in &self.base.entrypoints {
+            let base_path = PathBuf::from(&entrypoint.folder);
+
+            // Get absolute paths for both the entrypoint and input file
+            let absolute_base = base_path
+                .canonicalize()
+                .unwrap_or_else(|_| base_path.clone());
+            let absolute_input = input_path
+                .canonicalize()
+                .unwrap_or_else(|_| input_path.clone());
+
+            // Try to compute relative path for each entrypoint
+            if let Ok(relative_path) = absolute_input.strip_prefix(&absolute_base) {
+                // Construct the output path by joining the build folder with the relative path
+                let output_path = self
+                    .get_output_folder()?
+                    .join(relative_path)
+                    .with_extension("js");
+
+                // Ensure the output directory exists
+                if let Some(parent) = output_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        CommonError::Error(format!("Failed to create output directory: {:?}", e))
+                    })?;
+                }
+
+                return Ok(output_path);
+            }
+        }
+
+        Err(CommonError::Error(format!(
+            "File {:?} is not within any entrypoint folder. Entrypoints: {:?}",
+            input_path,
+            self.base
+                .entrypoints
+                .iter()
+                .map(|e| &e.folder)
+                .collect::<Vec<_>>()
+        )))
     }
 }

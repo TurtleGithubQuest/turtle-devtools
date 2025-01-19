@@ -1,46 +1,52 @@
-use std::collections::HashSet;
-use colored::{Color, Colorize};
-use std::env;
 use crate::misc::errors::transfer::TransferError;
-use crate::misc::transfer::Credentials;
+use crate::misc::transfer::{AuthMethod, Credentials};
+use colored::{Color, Colorize};
+use std::collections::HashSet;
+use std::{env, fs};
 
-pub fn color_log(color: Color, message: &str) {
-    let colored_message = colored::ColoredString::from(message);
-    
+pub fn color_log(color: Color, message: impl Into<std::string::String>) {
+    let colored_message = colored::ColoredString::from(message.into());
+
     println!("{}", colored_message.color(color));
 }
 
-pub fn get_credentials(protocol: &str) -> Result<Credentials, TransferError> {
+pub(crate) fn get_credentials(protocol: &str) -> Result<Credentials, TransferError> {
     let mut missing_vars = HashSet::new();
 
-    let (host_vars, username_vars, password_vars, port_vars, remote_dir_vars) = match protocol {
-        "ssh" => (
-            vec!["SSH_HOST", "HOST"],
-            vec!["SSH_USERNAME", "USERNAME"],
-            vec!["SSH_PASSWORD", "PASSWORD"],
-            vec!["SSH_PORT", "PORT"],
-            vec!["REMOTE_PATH"],
-        ),
-        "ftp" => (
-            vec!["FTP_HOST", "HOST"],
-            vec!["FTP_USERNAME", "USERNAME"],
-            vec!["FTP_PASSWORD", "PASSWORD"],
-            vec!["FTP_PORT", "PORT"],
-            vec!["REMOTE_PATH"],
-        ),
-        _ => {
-            return Err(TransferError::UnsupportedProtocol(protocol.to_string()));
-        }
-    };
+    let (host_vars, username_vars, password_vars, key_vars, port_vars, remote_dir_vars) =
+        match protocol {
+            "ssh" => (
+                vec!["SSH_HOST", "HOST"],
+                vec!["SSH_USERNAME", "USERNAME"],
+                vec!["SSH_PASSWORD", "PASSWORD"],
+                vec!["SSH_KEY_PATH"],
+                vec!["SSH_PORT", "PORT"],
+                vec!["REMOTE_PATH"],
+            ),
+            "ftp" => (
+                vec!["FTP_HOST", "HOST"],
+                vec!["FTP_USERNAME", "USERNAME"],
+                vec!["FTP_PASSWORD", "PASSWORD"],
+                vec![""],
+                vec!["FTP_PORT", "PORT"],
+                vec!["REMOTE_PATH"],
+            ),
+            _ => {
+                return Err(TransferError::UnsupportedProtocol(protocol.to_string()));
+            }
+        };
 
     // Function to get env var from a list of variable names
     fn get_env_var_from_list(var_names: &[&str]) -> Result<String, String> {
         for &var_name in var_names {
             if let Ok(val) = env::var(var_name) {
-                return Ok(val);
+                let clean_val = val.split('#').next().unwrap_or("").trim().to_string();
+                if !clean_val.is_empty() {
+                    return Ok(clean_val);
+                }
             }
         }
-        // Return the shared (last) variable name as missing
+
         let last_var = *var_names.last().unwrap();
         Err(last_var.to_string())
     }
@@ -62,12 +68,47 @@ pub fn get_credentials(protocol: &str) -> Result<Credentials, TransferError> {
         }
     };
 
-    let password = match get_env_var_from_list(&password_vars) {
-        Ok(val) => val,
-        Err(var) => {
-            missing_vars.insert(var);
-            String::new()
+    let auth_method = if protocol == "ssh" {
+        // Try to load key first
+        if let Ok(key_path) = get_env_var_from_list(&key_vars) {
+            // Try to read the key file
+            match fs::read_to_string(&key_path) {
+                Ok(key_content) => AuthMethod::Key(key_content),
+                Err(_) => {
+                    // If key file can't be read, try password
+                    match get_env_var_from_list(&password_vars) {
+                        Ok(password) => AuthMethod::Password(password),
+                        Err(var) => {
+                            missing_vars.insert(var);
+                            return Err(TransferError::MissingEnvironmentVariables(
+                                missing_vars.into_iter().collect(),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            // No key path, try password
+            match get_env_var_from_list(&password_vars) {
+                Ok(password) => AuthMethod::Password(password),
+                Err(var) => {
+                    missing_vars.insert(var);
+                    return Err(TransferError::MissingEnvironmentVariables(
+                        missing_vars.into_iter().collect(),
+                    ));
+                }
+            }
         }
+    } else {
+        // For non-SSH protocols, just use password
+        let password = match get_env_var_from_list(&password_vars) {
+            Ok(val) => val,
+            Err(var) => {
+                missing_vars.insert(var);
+                String::new()
+            }
+        };
+        AuthMethod::Password(password)
     };
 
     let remote_dir = match get_env_var_from_list(&remote_dir_vars) {
@@ -83,13 +124,14 @@ pub fn get_credentials(protocol: &str) -> Result<Credentials, TransferError> {
         Err(_) => {
             // Use default ports
             match protocol {
-                "ssh" => "22".to_string(),
-                "ftp" => "21".to_string(),
-                _ => "0".to_string(),
+                "ssh" => "22",
+                "ftp" => "21",
+                _ => "0",
             }
+            .to_string()
         }
     };
-    
+
     let port = match port_str.parse::<u16>() {
         Ok(val) => val,
         Err(_) => {
@@ -108,7 +150,7 @@ pub fn get_credentials(protocol: &str) -> Result<Credentials, TransferError> {
     Ok(Credentials {
         host,
         username,
-        password,
+        auth: auth_method,
         port,
         remote_dir,
     })

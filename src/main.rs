@@ -1,18 +1,18 @@
-use std::env;
-use std::path::PathBuf;
-use std::error::Error;
+use crate::misc::config;
+use crate::misc::errors::common::CommonError;
+use crate::misc::util::color_log;
+use crate::tasks::{build, deploy, watch};
 use async_recursion::async_recursion;
 use clap::Parser;
 use colored::Color;
+use std::env;
+use std::error::Error;
+use std::path::PathBuf;
 use tokio;
-use crate::misc::util::color_log;
-use crate::tasks::{build, deploy, watch};
-use crate::misc::config;
-use crate::misc::errors::common::CommonError;
 
-pub(crate) mod tasks;
-pub mod misc;
 pub mod contexts;
+pub mod misc;
+pub(crate) mod tasks;
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -29,16 +29,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     if let Some(working_dir) = &args.working_dir {
-        if let Err(e) = env::set_current_dir(working_dir) {
-            eprintln!(
-                "Failed to change working directory to {}: {}", working_dir.display(), e
-            );
-            std::process::exit(1);
-        }
+        // Convert to absolute path and canonicalize
+        let abs_path = if working_dir.is_relative() {
+            env::current_dir()?.join(working_dir)
+        } else {
+            working_dir.clone()
+        };
+
+        // Canonicalize to resolve any symlinks and normalize path
+        let canonical_path = abs_path.canonicalize().map_err(|e| {
+            format!(
+                "Failed to resolve working directory path {}: {}",
+                abs_path.display(),
+                e
+            )
+        })?;
+
+        env::set_current_dir(&canonical_path).map_err(|e| {
+            format!(
+                "Failed to change working directory to {}: {}",
+                canonical_path.display(),
+                e
+            )
+        })?;
     }
 
     config::Config::load().await?;
 
+    eprintln!("Starting task: {}", &args.task);
     if let Err(e) = run_task(&args.task).await {
         eprintln!("{}", e);
         std::process::exit(1);

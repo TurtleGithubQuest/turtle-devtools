@@ -1,6 +1,8 @@
 /target
 .idea
 
+repomix**
+.aider**
 
 #todo: remove
 Cargo.lock

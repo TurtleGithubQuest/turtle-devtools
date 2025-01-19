@@ -33,8 +33,10 @@ impl BuildContext for Context {
             self.build(path.as_path(), &output_folder)?;
         } else {
             for entrypoint in self.get_entrypoints() {
-                let entrypoint_path = Path::new(&entrypoint.entrypoint);
-                self.build(entrypoint_path, &output_folder)?;
+                if let Some(entrypoint_path) = &entrypoint.entrypoint {
+                    let entrypoint_path = Path::new(entrypoint_path);
+                    self.build(entrypoint_path, &output_folder)?;
+                }
             }
         }
         Ok(())

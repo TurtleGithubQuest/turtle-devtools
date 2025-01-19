@@ -1,39 +1,51 @@
-use std::collections::HashMap;
-use std::ops::Deref;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-use crate::misc::util::{color_log, get_credentials};
-use tokio::task::LocalSet;
-use crate::misc::transfer::{FileTransfer, upload_directory, get_transfer};
-use colored::Color;
-use notify::event::{DataChange, ModifyKind};
-use tokio::select;
 use crate::contexts::BuildContext;
-use crate::misc::config::{CONFIG};
+use crate::misc::config::CONFIG;
 use crate::misc::errors::common::CommonError;
 use crate::misc::errors::transfer::TransferError;
+use crate::misc::transfer::{get_transfer, upload_directory, FileTransfer};
+use crate::misc::util::{color_log, get_credentials};
+use colored::Color;
+use notify::event::{DataChange, ModifyKind};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use swc::{
+    config::{Config, JscConfig, ModuleConfig, Options},
+    Compiler,
+};
+use swc_common::{errors::Handler, FileName, SourceMap};
+use swc_ecma_parser::{Syntax, TsConfig};
+use tokio::select;
+use tokio::sync::mpsc;
+use tokio::task::LocalSet;
 
 pub async fn execute() -> Result<(), CommonError> {
     let local_set = LocalSet::new();
-    let (tx, mut rx) = mpsc::channel(100);
+    let (tx, mut rx) = mpsc::channel(1000);
 
     let mut watcher = RecommendedWatcher::new(
         move |res| {
             let tx = tx.clone();
-            tx.try_send(res).unwrap();
+            if let Err(e) = tx.try_send(res) {
+                color_log(
+                    Color::Red,
+                    format!("Failed to send file change notification: {:?}", e),
+                );
+            }
         },
         notify::Config::default(),
     )?;
 
-    let config = CONFIG.get().ok_or_else(|| CommonError::ConfigNotFound("Config not loaded".into()))?;
+    let config = CONFIG
+        .get()
+        .ok_or_else(|| CommonError::ConfigNotFound("Config not loaded".into()))?;
     let mut paths_to_watch = Vec::new();
 
     let result: Result<(), CommonError> = local_set.run_until(async move {
         if let Some(ref scss_context) = config.contexts.scss {
             for entry in scss_context.get_entrypoints() {
-                paths_to_watch.push(PathBuf::from(&entry.folder));
+                //paths_to_watch.push(PathBuf::from(&entry.folder));
             }
         }
 
@@ -73,11 +85,19 @@ pub async fn execute() -> Result<(), CommonError> {
                         if file_name.to_string_lossy().ends_with('~') {
                             continue;
                         }
-                        //DataChange::Content is not triggered?
-                        if let EventKind::Modify(ModifyKind::Data(DataChange::Any)) = event.kind {
-                            if changed_path.is_file() {
-                                debounce_map.insert(changed_path.clone(), Instant::now());
+                        match event.kind {
+                            EventKind::Modify(ModifyKind::Data(DataChange::Any)) |
+                            EventKind::Create(_) => {
+                                if changed_path.is_file() {
+                                    // Check if it's a JS/TS file
+                                    if let Some(ext) = changed_path.extension() {
+                                        if ext == "js" || ext == "ts" || ext == "tsx" {
+                                            debounce_map.insert(changed_path.clone(), Instant::now());
+                                        }
+                                    }
+                                }
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -122,34 +142,52 @@ async fn handle_file_change(
     changed_path: &PathBuf,
     config: crate::config::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let absolute_file_path = changed_path
+        .canonicalize()
+        .unwrap_or_else(|_| changed_path.to_path_buf());
+    color_log(
+        Color::BrightCyan,
+        &format!("Changed file: {:?}", absolute_file_path),
+    );
+
     let mut contexts_to_build: Vec<&dyn BuildContext> = Vec::new();
 
     if let Some(ref scss_context) = config.contexts.scss {
-        if scss_context.is_file_in_context(changed_path) {
+        if scss_context.is_file_in_context(&absolute_file_path) {
             contexts_to_build.push(scss_context);
         }
     }
 
     if let Some(ref js_context) = config.contexts.js {
-        if js_context.is_file_in_context(changed_path) {
+        if js_context.is_file_in_context(&absolute_file_path) {
             contexts_to_build.push(js_context);
         }
     }
-    
+
+    let remote_base_path = std::env::var("REMOTE_PATH")
+        .map_err(|_| CommonError::Error("REMOTE_PATH must be set in .env".to_string()))?;
+
     for context in contexts_to_build {
-        color_log(Color::Yellow, &format!("Building {} context...", context.context_name()));
-        context.build(Some(changed_path))?;
+        color_log(
+            Color::Yellow,
+            &format!("Building {} context...", context.context_name()),
+        );
+        context.build(Some(&absolute_file_path))?;
 
         let output_folder = context.get_output_folder()?;
 
-        let remote_path = context.context_name();
+        // Construct the full remote path by joining the base path with the context name
+        let remote_path = PathBuf::from(&remote_base_path)
+            .join(context.context_name())
+            .to_string_lossy()
+            .to_string();
 
-        upload_directory(
-            &mut *transfer,
-            &output_folder,
-            remote_path,
-        )
-        .await?;
+        color_log(
+            Color::Cyan,
+            &format!("Uploading to remote path: {}", remote_path),
+        );
+
+        upload_directory(&mut *transfer, &output_folder, &remote_path).await?;
     }
 
     Ok(())

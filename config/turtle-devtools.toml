@@ -1,0 +1,13 @@
+output_folder = "build"
+
+[contexts.scss]
+output_folder = "css"
+entrypoints = [
+    { folder = "scss", entrypoint = "scss/turtle.scss" },
+]
+
+[contexts.js]
+output_folder = "js"
+entrypoints = [
+    { folder = "src" }
+]

@@ -19,13 +19,17 @@ thiserror = "1.0.65"
 anyhow = "1.0.91"
 notify = "7.0.0"
 
-swc_bundler = "1.0.0"
-swc_common = { version = "1.0.0", features = ["tty-emitter"] }
-swc_ecma_parser = "1.0.1"
-swc_ecma_codegen = "1.0.0"
-swc_ecma_ast = "1.0.0"
-swc_ecma_loader = { version = "1.0.0", features = ["node", "cache"] }
+swc_bundler = "5.0.0"
+swc_common = { version = "4.0.1", features = ["tty-emitter"] }
+swc_ecma_parser = "5.0.0"
+swc_ecma_codegen = "4.0.2"
+swc_ecma_ast = "4.0.1"
+swc_ecma_loader = { version = "4.0.0", features = ["node", "cache"] }
+swc = "5.0.2"
+swc_ecma_transforms_typescript = "4.0.0"
+swc_ecma_visit = "4.0.0"
 lru = "0.12.5"
 parking_lot = "0.12.3"
 
 grass = "0.13.4"
+ignore = "0.4.23"
